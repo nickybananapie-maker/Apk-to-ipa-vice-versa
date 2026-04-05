@@ -69,10 +69,12 @@ class XcodeProjectBuilder:
         """
         Run the full pipeline.  Returns the path to the generated .xcodeproj.
         """
+        import time
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
 
-        print("  [1/6] Parsing APK...")
+        print("  [1/7] Parsing APK...")
         parser = ApkParser(self.apk_path)
         self._info = parser.parse()
 
@@ -82,10 +84,23 @@ class XcodeProjectBuilder:
             "ConvertedApp"
         )
 
-        # Extract APK
+        size_mb = self._info.total_size_bytes / (1024 * 1024)
+        print(f"         {self._info.package_name} — {self._info.total_files} files, {size_mb:.0f} MB")
+        if self._info.detected_engine:
+            print(f"         Engine: {self._info.detected_engine.title()}")
+
+        # Detect bundle type and extract
         extract_dir = output_dir / "_apk_extracted"
-        print("  [2/6] Extracting APK...")
-        parser.extract_all(extract_dir)
+        print("  [2/7] Extracting APK...")
+
+        from apk2ipa.core.bundle_handler import detect_bundle_type, extract_bundle
+        bundle_type = detect_bundle_type(self.apk_path)
+        if bundle_type in ("xapk", "apks"):
+            print(f"         Bundle detected ({bundle_type}) — merging split APKs...")
+            extract_dir, bundle_info = extract_bundle(self.apk_path, extract_dir)
+            print(f"         Merged {bundle_info['total_apks']} APKs")
+        else:
+            parser.extract_all(extract_dir)
 
         # Project root
         project_root = output_dir / app_name
@@ -95,31 +110,39 @@ class XcodeProjectBuilder:
         app_src.mkdir(exist_ok=True)
 
         # Translate manifest → Info.plist
-        print("  [3/6] Translating manifest...")
+        print("  [3/7] Translating manifest...")
         translator = ManifestTranslator(self._info)
         manifest_result = translator.translate()
         translator.write_plist(app_src / "Info.plist", manifest_result)
 
         # Convert resources
-        print("  [4/6] Converting resources...")
+        print("  [4/7] Converting resources...")
         res_converter = ResourceConverter(extract_dir)
         res_stats = res_converter.convert(app_src, apk_info=self._info)
+        print(f"         {res_stats.images_converted} images, {res_stats.sounds_copied} sounds, "
+              f"{res_stats.game_data_copied} game data, {res_stats.native_libs_cataloged} native libs")
 
         # Translate code
-        print("  [5/6] Decompiling and translating code...")
+        print("  [5/7] Decompiling and translating code...")
         code_translator = CodeTranslator(extract_dir, self._info)
         code_summary = code_translator.translate(app_src)
+        print(f"         {code_summary.get('swift_files_written', 0)} Swift files, "
+              f"{code_summary.get('layout_files_converted', 0)} layouts")
 
         # Generate Xcode project
-        print("  [6/6] Generating Xcode project...")
+        print("  [6/7] Generating Xcode project...")
         xcodeproj_path = self._generate_xcodeproj(
             project_root, app_name, app_src, self._info
         )
 
         # Write review guide
+        print("  [7/7] Writing review guide...")
         self._write_review_guide(
             project_root, app_name, manifest_result, res_stats, code_summary
         )
+
+        elapsed = time.time() - t0
+        print(f"\n  Completed in {elapsed:.1f}s")
 
         logger.info("Xcode project written to %s", xcodeproj_path)
         return xcodeproj_path
@@ -150,12 +173,30 @@ class XcodeProjectBuilder:
                          sorted(app_src.rglob("*.plist"))  # Info.plist added separately
         xcassets = list(app_src.rglob("*.xcassets"))
 
+        # Include ALL resource files in the project (fonts, sounds, game data, etc.)
+        bundle_resource_exts = {
+            ".ogg", ".mp3", ".wav", ".flac", ".aac", ".m4a", ".opus",
+            ".ttf", ".otf", ".woff",
+            ".mp4", ".3gp", ".webm",
+            ".csv", ".sc", ".json", ".bin", ".dat", ".lua", ".luac",
+            ".atlas", ".skel", ".fnt", ".tmx", ".pvr", ".ktx", ".astc",
+            ".bnk", ".wem", ".fsb",
+            ".xml", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+            ".db", ".sqlite",
+        }
+        extra_resources = []
+        resources_dir = app_src / "Resources"
+        if resources_dir.exists():
+            for f in sorted(resources_dir.rglob("*")):
+                if f.is_file() and f.suffix.lower() in bundle_resource_exts:
+                    extra_resources.append(f)
+
         pbxproj_content = self._render_pbxproj(
             app_name=app_name,
             bundle_id=info.package_name.replace("_", "-") if info.package_name else "com.example.app",
             deployment_target=ManifestTranslator._android_sdk_to_ios(info.min_sdk),
             swift_files=swift_files,
-            resource_files=resource_files,
+            resource_files=resource_files + extra_resources,
             xcassets=xcassets,
             app_src=app_src,
         )

@@ -52,6 +52,7 @@ def main(verbose: bool) -> None:
 @click.option("--no-decompile", is_flag=True,
               help="Skip DEX decompilation (generate stubs only)")
 def convert(apk_path: Path, output: Path | None, no_decompile: bool) -> None:
+    # Note: supports .apk, .xapk, .apks, .apkm bundle formats
     """
     Convert an APK to a buildable Xcode project.
 
@@ -141,6 +142,19 @@ def info(apk_path: Path) -> None:
             console.print("\n[bold]Permissions:[/bold]")
             for p in sorted(apk_info.permissions):
                 console.print(f"  • {p}")
+
+        if apk_info.detected_engine and apk_info.engine_details:
+            console.print(f"\n[bold]Game Engine: {apk_info.detected_engine.title()}[/bold]")
+            if apk_info.engine_details.get("note"):
+                console.print(f"  {apk_info.engine_details['note']}")
+            if apk_info.engine_details.get("ios_equivalent"):
+                console.print(f"  iOS: {apk_info.engine_details['ios_equivalent']}")
+
+        if apk_info.native_lib_archs:
+            console.print("\n[bold]Native Libraries by Architecture:[/bold]")
+            for arch, libs in sorted(apk_info.native_lib_archs.items()):
+                console.print(f"  [cyan]{arch}[/cyan]: {', '.join(libs[:10])}"
+                              + (f" (+{len(libs)-10} more)" if len(libs) > 10 else ""))
 
     else:
         click.echo(f"Package:    {apk_info.package_name}")

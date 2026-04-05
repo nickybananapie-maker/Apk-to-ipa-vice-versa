@@ -92,6 +92,9 @@ class ResourceConverter:
         self._copy_native_libs(output_dir, apk_info)
         self._copy_remaining_files(output_dir)
 
+        # Detect and handle compressed assets
+        self._detect_compressed_assets(output_dir)
+
         return self._stats
 
     # ------------------------------------------------------------------
@@ -679,6 +682,65 @@ class ResourceConverter:
         self._stats.other_files_copied = count
         if count:
             logger.info("Copied %d remaining files", count)
+
+    def _detect_compressed_assets(self, output_dir: Path) -> None:
+        """
+        Scan copied assets for compressed/packed formats and note them.
+        Tries to decompress LZMA/zlib-compressed files commonly found in game APKs
+        (e.g., Supercell .sc files are LZMA-compressed textures).
+        """
+        import zlib
+
+        resources_dir = output_dir / "Resources"
+        if not resources_dir.exists():
+            return
+
+        decompressed_count = 0
+
+        for item in resources_dir.rglob("*"):
+            if not item.is_file() or item.stat().st_size < 4:
+                continue
+
+            try:
+                header = item.read_bytes()[:16]
+            except OSError:
+                continue
+
+            # Supercell .sc files — LZMA compressed with "SC" header
+            if header[:2] == b"SC" and item.suffix.lower() == ".sc":
+                try:
+                    import lzma
+                    data = item.read_bytes()
+                    # SC format: "SC" + 4 bytes type + LZMA data
+                    compressed = data[26:]  # Skip SC header (varies)
+                    if len(compressed) > 5:
+                        try:
+                            decompressed = lzma.decompress(compressed)
+                            out_path = item.with_suffix(".sc.decompressed")
+                            out_path.write_bytes(decompressed)
+                            decompressed_count += 1
+                        except lzma.LZMAError:
+                            pass  # Not standard LZMA, keep as-is
+                except ImportError:
+                    pass  # lzma not available
+
+            # Generic zlib detection
+            elif header[:2] == b"\x78\x9c" or header[:2] == b"\x78\x01":
+                try:
+                    data = item.read_bytes()
+                    decompressed = zlib.decompress(data)
+                    out_path = item.with_suffix(item.suffix + ".decompressed")
+                    out_path.write_bytes(decompressed)
+                    decompressed_count += 1
+                except zlib.error:
+                    pass
+
+        if decompressed_count:
+            logger.info("Decompressed %d compressed assets", decompressed_count)
+            self._stats.warnings.append(
+                f"Decompressed {decompressed_count} compressed assets "
+                "(look for .decompressed files alongside originals)"
+            )
 
 
 # ---------------------------------------------------------------------------

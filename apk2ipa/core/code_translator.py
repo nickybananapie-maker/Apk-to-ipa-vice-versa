@@ -41,6 +41,7 @@ class CodeTranslator:
         self._transpiler = JavaToSwiftTranspiler()
         self._layout_converter = LayoutConverter()
         self._decompiled_java: Optional[Path] = None
+        self._proguard_map: dict[str, str] = {}  # obfuscated → original names
 
     def translate(self, output_dir: str | Path) -> dict:
         """
@@ -56,14 +57,19 @@ class CodeTranslator:
             "layout_files_converted": 0,
             "warnings": [],
             "decompiler_used": "none",
+            "obfuscation_detected": False,
+            "proguard_mappings_loaded": 0,
         }
+
+        # Step 0: Load ProGuard mapping if available
+        self._load_proguard_mapping(summary)
 
         # Step 1: Decompile DEX → Java
         java_dir = self._decompile_dex(summary)
 
-        # Step 2: Transpile Java → Swift
+        # Step 2: Transpile Java → Swift (with parallel processing for speed)
         if java_dir and java_dir.exists():
-            self._transpile_java_dir(java_dir, output_dir, summary)
+            self._transpile_java_dir_parallel(java_dir, output_dir, summary)
 
         # Step 3: Convert XML layouts → SwiftUI
         self._convert_layouts(output_dir, summary)
@@ -72,6 +78,97 @@ class CodeTranslator:
         self._generate_app_boilerplate(output_dir)
 
         return summary
+
+    # ------------------------------------------------------------------
+    # ProGuard / Obfuscation handling
+    # ------------------------------------------------------------------
+
+    def _load_proguard_mapping(self, summary: dict) -> None:
+        """Load ProGuard/R8 mapping.txt if present in the APK."""
+        # Common locations for mapping files
+        mapping_candidates = [
+            self.apk_root / "mapping.txt",
+            self.apk_root / "proguard" / "mapping.txt",
+            self.apk_root / "META-INF" / "mapping.txt",
+        ]
+
+        for path in mapping_candidates:
+            if path.exists():
+                try:
+                    self._parse_proguard_mapping(path)
+                    summary["proguard_mappings_loaded"] = len(self._proguard_map)
+                    logger.info("Loaded %d ProGuard mappings from %s",
+                                len(self._proguard_map), path)
+                    return
+                except Exception as e:
+                    logger.warning("Failed to parse ProGuard mapping: %s", e)
+
+    def _parse_proguard_mapping(self, path: Path) -> None:
+        """Parse a ProGuard mapping.txt file."""
+        current_class_obf = ""
+        current_class_orig = ""
+
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.rstrip()
+            if not line or line.startswith("#"):
+                continue
+
+            if not line.startswith(" ") and " -> " in line and line.endswith(":"):
+                # Class mapping: com.original.Name -> a.b.c:
+                parts = line.rstrip(":").split(" -> ")
+                if len(parts) == 2:
+                    original = parts[0].strip()
+                    obfuscated = parts[1].strip()
+                    self._proguard_map[obfuscated] = original
+                    current_class_obf = obfuscated
+                    current_class_orig = original
+
+            elif line.startswith("    ") and " -> " in line:
+                # Member mapping:     originalMethod -> a
+                parts = line.strip().split(" -> ")
+                if len(parts) == 2 and current_class_obf:
+                    original = parts[0].strip().split()[-1]  # get name after type
+                    obfuscated = parts[1].strip()
+                    key = f"{current_class_obf}.{obfuscated}"
+                    self._proguard_map[key] = f"{current_class_orig}.{original}"
+
+    def _detect_obfuscation(self, java_dir: Path, summary: dict) -> None:
+        """Detect if the code is obfuscated by checking class/method name patterns."""
+        short_name_count = 0
+        total_files = 0
+
+        for java_file in java_dir.rglob("*.java"):
+            total_files += 1
+            name = java_file.stem
+            # Single letter or very short names suggest obfuscation
+            if len(name) <= 2 and name.isalpha():
+                short_name_count += 1
+
+        if total_files > 0:
+            ratio = short_name_count / total_files
+            if ratio > 0.3:  # More than 30% short names
+                summary["obfuscation_detected"] = True
+                summary["warnings"].append(
+                    f"Obfuscation detected: {short_name_count}/{total_files} classes "
+                    f"have very short names ({ratio:.0%}). "
+                    "Code quality will be limited. If you have a ProGuard mapping.txt, "
+                    "place it alongside the APK."
+                )
+
+    def _deobfuscate_source(self, source: str) -> str:
+        """Apply ProGuard mappings to deobfuscate class/method names in source."""
+        if not self._proguard_map:
+            return source
+        result = source
+        # Sort by length descending to avoid partial replacements
+        for obf, orig in sorted(self._proguard_map.items(),
+                                  key=lambda x: len(x[0]), reverse=True):
+            # Only replace full identifiers (word boundaries)
+            short_obf = obf.split(".")[-1]
+            short_orig = orig.split(".")[-1]
+            if short_obf and short_orig and short_obf != short_orig:
+                result = re.sub(rf"\b{re.escape(short_obf)}\b", short_orig, result)
+        return result
 
     # ------------------------------------------------------------------
     # DEX Decompilation
@@ -207,11 +304,15 @@ class CodeTranslator:
 
     def _transpile_java_dir(self, java_dir: Path,
                              output_dir: Path, summary: dict) -> None:
-        """Walk all .java files and transpile each one."""
+        """Walk all .java files and transpile each one (sequential)."""
         for java_file in sorted(java_dir.rglob("*.java")):
             summary["java_files_found"] += 1
             try:
                 source = java_file.read_text(encoding="utf-8", errors="replace")
+
+                # Apply deobfuscation if mappings available
+                source = self._deobfuscate_source(source)
+
                 class_name = java_file.stem
 
                 result = self._transpiler.transpile(source, class_name)
@@ -231,6 +332,55 @@ class CodeTranslator:
             except Exception as e:
                 summary["warnings"].append(f"Failed to transpile {java_file.name}: {e}")
                 logger.debug("Transpile error for %s: %s", java_file, e)
+
+    def _transpile_java_dir_parallel(self, java_dir: Path,
+                                       output_dir: Path, summary: dict) -> None:
+        """Walk all .java files and transpile using thread pool for speed."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        java_files = sorted(java_dir.rglob("*.java"))
+        summary["java_files_found"] = len(java_files)
+
+        if not java_files:
+            return
+
+        # Detect obfuscation
+        self._detect_obfuscation(java_dir, summary)
+
+        def transpile_one(java_file: Path) -> tuple[bool, str]:
+            """Transpile a single file. Returns (success, warning_or_empty)."""
+            try:
+                source = java_file.read_text(encoding="utf-8", errors="replace")
+                source = self._deobfuscate_source(source)
+                class_name = java_file.stem
+
+                result = self._transpiler.transpile(source, class_name)
+
+                rel = java_file.relative_to(java_dir)
+                swift_path = output_dir / rel.with_suffix(".swift")
+                swift_path.parent.mkdir(parents=True, exist_ok=True)
+                swift_path.write_text(result.swift_source, encoding="utf-8")
+
+                warning = ""
+                if result.issues:
+                    warning = f"{java_file.name}: {len(result.issues)} translation issues"
+                return (True, warning)
+            except Exception as e:
+                return (False, f"Failed to transpile {java_file.name}: {e}")
+
+        # Use thread pool — javalang parsing is CPU-bound but GIL-limited,
+        # file I/O is the real bottleneck for large APKs
+        workers = min(8, len(java_files))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(transpile_one, f): f for f in java_files}
+
+            for future in as_completed(futures):
+                success, warning = future.result()
+                if success:
+                    summary["swift_files_written"] += 1
+                if warning:
+                    summary["warnings"].append(warning)
 
     # ------------------------------------------------------------------
     # Layout conversion
