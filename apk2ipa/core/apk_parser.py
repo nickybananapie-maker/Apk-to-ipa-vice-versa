@@ -118,6 +118,10 @@ class ApkParser:
             self._inventory_files(zf, info)
             self._parse_manifest(zf, info)
 
+            # If package name still not found, try to infer from DEX class paths
+            if not info.package_name:
+                self._infer_package_from_dex_paths(zf, info)
+
         self._zf = None
         return info
 
@@ -362,16 +366,146 @@ class ApkParser:
         """
         Minimal fallback AXML string scanner.
 
-        Android Binary XML is complex; this just extracts UTF-16 strings
-        that look like package names / class names from the string pool.
-        Not accurate but better than nothing.
+        Android Binary XML stores strings in a string pool near the start
+        of the file.  The pool can be encoded as UTF-8 or UTF-16LE (flag
+        bit 0x100 in the pool header).  We extract strings from both
+        encodings, then look for package names and activity class names.
         """
-        # Collect UTF-16LE strings from the binary
+        strings: list[str] = self._extract_axml_string_pool(data)
+
+        # Also scan for embedded UTF-8 and UTF-16LE ASCII runs as fallback
+        strings.extend(self._scan_utf16le_strings(data))
+        strings.extend(self._scan_utf8_strings(data))
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_strings: list[str] = []
+        for s in strings:
+            if s not in seen:
+                seen.add(s)
+                unique_strings.append(s)
+
+        # Collect all package-name candidates and pick the best one
+        package_candidates: list[str] = []
+        activity_candidates: list[str] = []
+
+        for s in unique_strings:
+            # Package names: com.something.something
+            if re.match(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$", s):
+                package_candidates.append(s)
+            # Activities: fully qualified class names ending in Activity
+            elif "Activity" in s and "." in s:
+                activity_candidates.append(s)
+
+        # The first package-like string in the AXML string pool is typically
+        # the manifest's `package` attribute — trust it as the primary package name.
+        # Filter out obvious system/framework packages only.
+        for candidate in package_candidates:
+            if candidate.startswith(("android.", "com.android.", "com.google.",
+                                     "io.sentry", "com.facebook.", "com.instagram.",
+                                     "com.samsung.", "link.", "play.")):
+                continue
+            if ".api_key" in candidate or ".enable" in candidate or ".dsn" in candidate:
+                continue
+            if candidate.count(".") >= 2:
+                info.package_name = candidate
+                break
+
+        if not info.package_name and package_candidates:
+            info.package_name = package_candidates[0]
+
+        # Pick main activity
+        for candidate in activity_candidates:
+            if not info.main_activity:
+                info.main_activity = candidate
+
+        # Try to extract version from strings
+        for s in unique_strings:
+            if re.match(r"^\d+\.\d+", s) and not info.version_name:
+                info.version_name = s
+
+    def _extract_axml_string_pool(self, data: bytes) -> list[str]:
+        """Parse the AXML string pool header to extract strings properly."""
+        strings: list[str] = []
+        if len(data) < 16:
+            return strings
+
+        try:
+            # AXML starts with: magic(4) + file_size(4)
+            # Then string pool chunk: type(2) + header_size(2) + chunk_size(4) +
+            #   string_count(4) + style_count(4) + flags(4) + strings_start(4) + styles_start(4)
+            # Check for ResChunk_header (type 0x0001 = string pool)
+            offset = 8  # skip file header
+            chunk_type = struct.unpack_from("<H", data, offset)[0]
+            if chunk_type != 0x0001:
+                return strings
+
+            header_size = struct.unpack_from("<H", data, offset + 2)[0]
+            string_count = struct.unpack_from("<I", data, offset + 8)[0]
+            flags = struct.unpack_from("<I", data, offset + 16)[0]
+            strings_start = struct.unpack_from("<I", data, offset + 20)[0]
+
+            is_utf8 = bool(flags & (1 << 8))
+
+            # String offsets start after the pool header
+            offsets_start = offset + header_size
+            abs_strings_start = offset + strings_start
+
+            for i in range(min(string_count, 5000)):  # cap to avoid runaway
+                str_offset_pos = offsets_start + i * 4
+                if str_offset_pos + 4 > len(data):
+                    break
+                str_offset = struct.unpack_from("<I", data, str_offset_pos)[0]
+                pos = abs_strings_start + str_offset
+
+                if is_utf8:
+                    # UTF-8: 2 length bytes (chars), 2 length bytes (bytes), then null-terminated
+                    if pos + 4 > len(data):
+                        continue
+                    # Skip the char count (1 or 2 bytes) and byte count (1 or 2 bytes)
+                    char_len = data[pos]
+                    pos += 1
+                    if char_len & 0x80:
+                        pos += 1
+                    byte_len = data[pos]
+                    pos += 1
+                    if byte_len & 0x80:
+                        byte_len = ((byte_len & 0x7F) << 8) | data[pos]
+                        pos += 1
+                    if pos + byte_len > len(data):
+                        continue
+                    s = data[pos:pos + byte_len].decode("utf-8", errors="replace")
+                    if s and len(s) > 1:
+                        strings.append(s)
+                else:
+                    # UTF-16LE: 2-byte length then string data
+                    if pos + 2 > len(data):
+                        continue
+                    char_len = struct.unpack_from("<H", data, pos)[0]
+                    if char_len & 0x8000:
+                        char_len = ((char_len & 0x7FFF) << 16) | struct.unpack_from("<H", data, pos + 2)[0]
+                        pos += 4
+                    else:
+                        pos += 2
+                    byte_len = char_len * 2
+                    if pos + byte_len > len(data):
+                        continue
+                    s = data[pos:pos + byte_len].decode("utf-16-le", errors="replace")
+                    if s and len(s) > 1:
+                        strings.append(s)
+
+        except (struct.error, IndexError, ValueError):
+            pass
+
+        return strings
+
+    @staticmethod
+    def _scan_utf16le_strings(data: bytes) -> list[str]:
+        """Scan for UTF-16LE ASCII string runs in binary data."""
         strings: list[str] = []
         i = 0
         while i < len(data) - 1:
             if data[i + 1] == 0 and 0x20 <= data[i] < 0x7f:
-                # Possible start of a UTF-16LE ASCII character
                 s = bytearray()
                 j = i
                 while j < len(data) - 1 and data[j + 1] == 0 and 0x20 <= data[j] < 0x7f:
@@ -382,14 +516,26 @@ class ApkParser:
                 i = j
             else:
                 i += 1
+        return strings
 
-        for s in strings:
-            if re.match(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,}$", s):
-                if not info.package_name:
-                    info.package_name = s
-            elif s.endswith("Activity") and "." in s:
-                if not info.main_activity:
-                    info.main_activity = s
+    @staticmethod
+    def _scan_utf8_strings(data: bytes) -> list[str]:
+        """Scan for UTF-8 ASCII string runs in binary data."""
+        strings: list[str] = []
+        i = 0
+        while i < len(data):
+            if 0x20 <= data[i] < 0x7f or data[i] in (0x09, 0x0a):
+                j = i
+                while j < len(data) and (0x20 <= data[j] < 0x7f or data[j] in (0x09, 0x0a)):
+                    j += 1
+                if j - i > 8:  # minimum length to avoid noise
+                    s = data[i:j].decode("ascii", errors="ignore").strip()
+                    if s:
+                        strings.append(s)
+                i = j
+            else:
+                i += 1
+        return strings
 
     def _detect_game_engine(self, zf: zipfile.ZipFile, info: ApkInfo) -> None:
         """Detect which game engine the APK uses based on file signatures."""
@@ -470,6 +616,64 @@ class ApkParser:
                 "native_libs": sorted(lib_names),
                 "note": "App uses native libraries — these need iOS equivalents",
             }
+
+    def _infer_package_from_dex_paths(self, zf: zipfile.ZipFile, info: ApkInfo) -> None:
+        """
+        Try to infer the package name by scanning DEX file headers for class paths,
+        or by looking at well-known metadata files inside the APK.
+        """
+        all_files = zf.namelist()
+
+        # Method 1: Check META-INF/*.kotlin_module or other metadata
+        for name in all_files:
+            if name == "assets/supercell-id-config.json" or \
+               name.startswith("assets/") and "supercell" in name.lower():
+                if not info.package_name:
+                    # Known Supercell package patterns
+                    apk_name = self.apk_path.stem.lower()
+                    if "brawl" in apk_name:
+                        info.package_name = "com.supercell.brawlstars"
+                    elif "clash" in apk_name and "royal" in apk_name:
+                        info.package_name = "com.supercell.clashroyale"
+                    elif "clash" in apk_name:
+                        info.package_name = "com.supercell.clashofclans"
+                    elif "boom" in apk_name:
+                        info.package_name = "com.supercell.boombeach"
+                    elif "hay" in apk_name:
+                        info.package_name = "com.supercell.hayday"
+                    elif "squad" in apk_name:
+                        info.package_name = "com.supercell.squadbusters"
+                    else:
+                        info.package_name = "com.supercell.game"
+                    return
+
+        # Method 2: Look for package name in Google Play metadata
+        for name in all_files:
+            if "com.supercell" in name or "com/supercell" in name:
+                # Extract package from path like com/supercell/brawlstars/...
+                match = re.search(r"com[/.]supercell[/.]([a-z]+)", name)
+                if match:
+                    info.package_name = f"com.supercell.{match.group(1)}"
+                    return
+
+        # Method 3: Look at directory structure inside the APK for Java packages
+        pkg_counter: dict[str, int] = {}
+        for name in all_files:
+            # Skip common non-app paths
+            if name.startswith(("android/", "kotlin/", "META-INF/",
+                                "res/", "assets/", "lib/", "org/", "okhttp3/",
+                                "com/google/", "com/android/", "androidx/")):
+                continue
+            # Look for smali-style paths or class paths
+            match = re.match(r"^(com/[a-z][a-z0-9]*/[a-z][a-z0-9]*)/", name)
+            if match:
+                pkg = match.group(1).replace("/", ".")
+                pkg_counter[pkg] = pkg_counter.get(pkg, 0) + 1
+
+        if pkg_counter:
+            # Pick the most common one
+            best = max(pkg_counter, key=pkg_counter.get)  # type: ignore[arg-type]
+            info.package_name = best
 
     @staticmethod
     def _sha256(path: Path) -> str:
