@@ -51,7 +51,12 @@ def main(verbose: bool) -> None:
               default=None, help="Output directory (default: ./output/<app_name>)")
 @click.option("--no-decompile", is_flag=True,
               help="Skip DEX decompilation (generate stubs only)")
-def convert(apk_path: Path, output: Path | None, no_decompile: bool) -> None:
+@click.option("--ipa", is_flag=True, help="Also package as .ipa after conversion")
+@click.option("--upload", default=None, metavar="OWNER/REPO",
+              help="Upload .ipa to a GitHub release (requires --ipa)")
+@click.option("--token", default=None, help="GitHub token (or set GITHUB_TOKEN env)")
+def convert(apk_path: Path, output: Path | None, no_decompile: bool,
+            ipa: bool, upload: str | None, token: str | None) -> None:
     # Note: supports .apk, .xapk, .apks, .apkm bundle formats
     """
     Convert an APK to a buildable Xcode project.
@@ -59,9 +64,13 @@ def convert(apk_path: Path, output: Path | None, no_decompile: bool) -> None:
     \b
     Example:
         apk2ipa convert myapp.apk
-        apk2ipa convert myapp.apk --output ~/Desktop/ios_project
+        apk2ipa convert myapp.apk --ipa
+        apk2ipa convert myapp.apk --ipa --upload user/repo --token ghp_xxx
     """
     from apk2ipa.core.ipa_builder import XcodeProjectBuilder
+
+    if upload and not ipa:
+        ipa = True  # --upload implies --ipa
 
     if output is None:
         output = Path("output")
@@ -73,13 +82,33 @@ def convert(apk_path: Path, output: Path | None, no_decompile: bool) -> None:
         builder = XcodeProjectBuilder(apk_path)
         xcodeproj = builder.build(output_dir=output)
 
-        click.echo("\n✓ Done!")
+        click.echo("\n✓ Xcode project ready!")
         click.echo(f"\nXcode project: {xcodeproj}")
         click.echo(f"Review guide:  {xcodeproj.parent / 'README_REVIEW.md'}")
-        click.echo("\nNext steps:")
-        click.echo("  1. Open the .xcodeproj in Xcode (Mac or iPad)")
-        click.echo("  2. Set your Development Team (Signing & Capabilities)")
-        click.echo("  3. Build — review README_REVIEW.md for known issues")
+
+        ipa_path = None
+        if ipa:
+            from apk2ipa.core.ipa_packager import package_ipa
+            app_name = apk_path.stem.replace(".", "_").replace(" ", "")
+            project_dir = xcodeproj.parent
+            ipa_path = package_ipa(
+                project_dir, app_name=app_name,
+                output_path=output / f"{app_name}.ipa"
+            )
+            click.echo(f"\n✓ IPA created: {ipa_path}")
+
+        if upload and ipa_path:
+            from apk2ipa.core.uploader import upload_to_release
+            click.echo(f"\nUploading to GitHub ({upload})...")
+            download_url = upload_to_release(
+                ipa_path, repo=upload, token=token
+            )
+            click.echo(f"\n✓ Download your IPA: {download_url}")
+        elif not upload:
+            click.echo("\nNext steps:")
+            click.echo("  1. Open the .xcodeproj in Xcode (Mac or iPad)")
+            click.echo("  2. Set your Development Team (Signing & Capabilities)")
+            click.echo("  3. Build — review README_REVIEW.md for known issues")
 
     except FileNotFoundError as e:
         click.echo(f"\n✗ Error: {e}", err=True)
@@ -244,20 +273,34 @@ def layout(xml_path: Path, output: Path | None, name: str | None) -> None:
 @click.option("--output", "-o", type=click.Path(path_type=Path),
               default=None, help="Output .ipa path")
 @click.option("--name", "-n", default=None, help="App name for the .ipa bundle")
-def package(project_dir: Path, output: Path | None, name: str | None) -> None:
+@click.option("--upload", default=None, metavar="OWNER/REPO",
+              help="Upload .ipa to a GitHub release after packaging")
+@click.option("--token", default=None, help="GitHub token (or set GITHUB_TOKEN env)")
+def package(project_dir: Path, output: Path | None, name: str | None,
+            upload: str | None, token: str | None) -> None:
     """
     Package a converted Xcode project into a .ipa file.
 
     \b
     Example:
         apk2ipa package output/brawl_stars/ConvertedApp
-        apk2ipa package output/MyApp/ConvertedApp -o MyApp.ipa
+        apk2ipa package output/MyApp -o MyApp.ipa
+        apk2ipa package output/MyApp --upload user/repo --token ghp_xxx
     """
     from apk2ipa.core.ipa_packager import package_ipa
 
     try:
         ipa_path = package_ipa(project_dir, output_path=output, app_name=name)
         click.echo(f"\n✓ IPA created: {ipa_path}")
+
+        if upload:
+            from apk2ipa.core.uploader import upload_to_release
+            click.echo(f"\nUploading to GitHub ({upload})...")
+            download_url = upload_to_release(
+                ipa_path, repo=upload, token=token
+            )
+            click.echo(f"\n✓ Download your IPA: {download_url}")
+
     except Exception as e:
         click.echo(f"\n✗ Packaging failed: {e}", err=True)
         logging.exception("Packaging error")
