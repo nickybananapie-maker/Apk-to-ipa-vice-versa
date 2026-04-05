@@ -1,0 +1,23 @@
+# Core APK analysis
+androguard>=3.3.5
+pyaxmlparser>=0.3.27
+
+# Java parsing (for Java→Swift transpilation)
+javalang>=0.13.0
+
+# CLI
+click>=8.1.0
+rich>=13.0.0
+
+# Image processing (drawable conversion)
+Pillow>=10.0.0
+
+# XML/HTML processing
+lxml>=4.9.0
+
+# Template rendering
+Jinja2>=3.1.0
+
+# Utilities
+tqdm>=4.65.0
+colorama>=0.4.6
