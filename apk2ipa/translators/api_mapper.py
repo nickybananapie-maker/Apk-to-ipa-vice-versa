@@ -261,6 +261,63 @@ CLASS_MAP: dict[str, ClassMapping] = {
     "ViewCompat":           ClassMapping("UIView"),
     "ActivityCompat":       ClassMapping("UIViewController"),
     "ContextCompat":        ClassMapping("UIApplication"),
+
+    # -----------------------------------------------------------------------
+    # Game / Graphics / OpenGL
+    # -----------------------------------------------------------------------
+    "GLSurfaceView":        ClassMapping("MTKView", import_module="MetalKit",
+                                        notes="GLSurfaceView → MTKView (Metal) or GLKView (deprecated OpenGL ES)"),
+    "GLSurfaceView.Renderer": ClassMapping("MTKViewDelegate", import_module="MetalKit",
+                                           notes="Implement draw(in:) for Metal rendering"),
+    "SurfaceView":          ClassMapping("UIView", notes="Use CAMetalLayer or CADisplayLink for custom rendering"),
+    "SurfaceHolder":        ClassMapping("CAMetalLayer", import_module="QuartzCore"),
+    "TextureView":          ClassMapping("UIView", notes="Use AVPlayerLayer or CAMetalLayer"),
+    "GLES20":               ClassMapping("MTLDevice", import_module="Metal",
+                                        notes="OpenGL ES 2.0 → Metal. Use Metal shading language instead of GLSL"),
+    "GLES30":               ClassMapping("MTLDevice", import_module="Metal",
+                                        notes="OpenGL ES 3.0 → Metal"),
+    "EGL14":                ClassMapping("CAMetalLayer", import_module="QuartzCore",
+                                        notes="EGL context → CAMetalLayer + MTLDevice"),
+    "GLUtils":              ClassMapping("MTKTextureLoader", import_module="MetalKit"),
+
+    # -----------------------------------------------------------------------
+    # Game Services / In-App Purchase
+    # -----------------------------------------------------------------------
+    "BillingClient":        ClassMapping("SKPaymentQueue", import_module="StoreKit",
+                                        notes="Google Play Billing → StoreKit (use StoreKit 2 for modern API)"),
+    "BillingFlowParams":    ClassMapping("SKPayment", import_module="StoreKit"),
+    "Purchase":             ClassMapping("SKPaymentTransaction", import_module="StoreKit"),
+    "SkuDetails":           ClassMapping("SKProduct", import_module="StoreKit"),
+    "GoogleSignInClient":   ClassMapping("ASAuthorizationAppleIDProvider", import_module="AuthenticationServices",
+                                        notes="Google Sign-In → Sign in with Apple"),
+    "GoogleApiClient":      ClassMapping("NSObject", notes="Google API → use iOS-specific SDKs"),
+    "GamesClient":          ClassMapping("GKLocalPlayer", import_module="GameKit",
+                                        notes="Google Play Games → Game Center (GameKit)"),
+    "LeaderboardsClient":   ClassMapping("GKLeaderboard", import_module="GameKit"),
+    "AchievementsClient":   ClassMapping("GKAchievement", import_module="GameKit"),
+
+    # -----------------------------------------------------------------------
+    # Firebase (common in Supercell & many games)
+    # -----------------------------------------------------------------------
+    "FirebaseApp":          ClassMapping("FirebaseApp", import_module="FirebaseCore",
+                                        notes="Install Firebase iOS SDK via SPM"),
+    "FirebaseMessaging":    ClassMapping("Messaging", import_module="FirebaseMessaging"),
+    "FirebaseAnalytics":    ClassMapping("Analytics", import_module="FirebaseAnalytics"),
+    "FirebaseCrashlytics":  ClassMapping("Crashlytics", import_module="FirebaseCrashlytics"),
+    "RemoteConfig":         ClassMapping("RemoteConfig", import_module="FirebaseRemoteConfig"),
+    "FirebaseAuth":         ClassMapping("Auth", import_module="FirebaseAuth"),
+    "FirebaseFirestore":    ClassMapping("Firestore", import_module="FirebaseFirestore"),
+    "FirebaseDatabase":     ClassMapping("Database", import_module="FirebaseDatabase"),
+    "FirebaseStorage":      ClassMapping("Storage", import_module="FirebaseStorage"),
+
+    # -----------------------------------------------------------------------
+    # Ads (common in mobile games)
+    # -----------------------------------------------------------------------
+    "AdView":               ClassMapping("GADBannerView", import_module="GoogleMobileAds",
+                                        notes="AdMob banner → GADBannerView (install Google Mobile Ads SDK)"),
+    "InterstitialAd":       ClassMapping("GADInterstitialAd", import_module="GoogleMobileAds"),
+    "RewardedAd":           ClassMapping("GADRewardedAd", import_module="GoogleMobileAds"),
+    "AdRequest":            ClassMapping("GADRequest", import_module="GoogleMobileAds"),
 }
 
 

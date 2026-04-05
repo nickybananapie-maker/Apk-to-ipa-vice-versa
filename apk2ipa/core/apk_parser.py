@@ -58,6 +58,28 @@ class ApkInfo:
     native_libs: list[str] = field(default_factory=list)
     other_files: list[str] = field(default_factory=list)
 
+    # Extended inventory for full-fidelity conversion
+    sound_files: list[str] = field(default_factory=list)
+    config_files: list[str] = field(default_factory=list)
+    font_files: list[str] = field(default_factory=list)
+    video_files: list[str] = field(default_factory=list)
+    game_data_files: list[str] = field(default_factory=list)     # .csv, .json, .sc, etc.
+    raw_resource_files: list[str] = field(default_factory=list)  # res/raw/*
+    xml_files: list[str] = field(default_factory=list)           # non-layout XML
+    kotlin_modules: list[str] = field(default_factory=list)      # kotlin metadata
+    signing_files: list[str] = field(default_factory=list)       # META-INF/*
+
+    # Game engine detection
+    detected_engine: str = ""          # "supercell", "unity", "unreal", "cocos2d", "libgdx", ""
+    engine_details: dict = field(default_factory=dict)  # engine-specific metadata
+
+    # Native lib details: arch → list of lib names
+    native_lib_archs: dict = field(default_factory=dict)
+
+    # Total file count and size
+    total_files: int = 0
+    total_size_bytes: int = 0
+
     # Raw bytes of key files (populated by ApkParser)
     raw_manifest: bytes = b""
 
@@ -135,21 +157,98 @@ class ApkParser:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # File extensions for categorization
+    _SOUND_EXTS = {".ogg", ".mp3", ".wav", ".flac", ".aac", ".m4a", ".opus", ".mid", ".midi"}
+    _VIDEO_EXTS = {".mp4", ".3gp", ".webm", ".mkv", ".avi"}
+    _FONT_EXTS = {".ttf", ".otf", ".woff", ".woff2"}
+    _CONFIG_EXTS = {".properties", ".cfg", ".ini", ".conf", ".yml", ".yaml", ".toml"}
+    _GAME_DATA_EXTS = {".csv", ".sc", ".json", ".bin", ".dat", ".db", ".sqlite",
+                       ".lua", ".luac", ".pkl", ".tex", ".pvr", ".ktx", ".astc",
+                       ".bnk", ".wem", ".fsb", ".atlas", ".skel", ".fnt", ".tmx"}
+
     def _inventory_files(self, zf: zipfile.ZipFile, info: ApkInfo) -> None:
-        """Categorise every file inside the APK."""
-        for name in zf.namelist():
+        """Categorise every file inside the APK — leaves nothing out."""
+        info.total_files = len(zf.namelist())
+        info.total_size_bytes = sum(zi.file_size for zi in zf.infolist())
+
+        for zi in zf.infolist():
+            name = zi.filename
+            if name.endswith("/"):  # directory entry
+                continue
+
+            ext = os.path.splitext(name)[1].lower()
+
+            # DEX bytecode
             if name.startswith("classes") and name.endswith(".dex"):
                 info.dex_files.append(name)
+
+            # Layouts
             elif name.startswith("res/layout") and name.endswith(".xml"):
                 info.layout_files.append(name)
+
+            # Drawables & mipmaps
             elif name.startswith("res/drawable") or name.startswith("res/mipmap"):
                 info.drawable_files.append(name)
+
+            # Raw resources
+            elif name.startswith("res/raw/"):
+                info.raw_resource_files.append(name)
+
+            # Other res/ XML files (values, menu, anim, etc.)
+            elif name.startswith("res/") and name.endswith(".xml"):
+                info.xml_files.append(name)
+
+            # Assets — sub-categorize
             elif name.startswith("assets/"):
                 info.asset_files.append(name)
+                if ext in self._SOUND_EXTS:
+                    info.sound_files.append(name)
+                elif ext in self._VIDEO_EXTS:
+                    info.video_files.append(name)
+                elif ext in self._FONT_EXTS:
+                    info.font_files.append(name)
+                elif ext in self._GAME_DATA_EXTS:
+                    info.game_data_files.append(name)
+                elif ext in self._CONFIG_EXTS:
+                    info.config_files.append(name)
+
+            # Native libraries
             elif name.startswith("lib/") and name.endswith(".so"):
                 info.native_libs.append(name)
+                # Track by architecture
+                parts = name.split("/")
+                if len(parts) >= 3:
+                    arch = parts[1]  # e.g. arm64-v8a, armeabi-v7a, x86_64
+                    if arch not in info.native_lib_archs:
+                        info.native_lib_archs[arch] = []
+                    info.native_lib_archs[arch].append(parts[-1])
+
+            # Kotlin metadata
+            elif name.startswith("kotlin/") or name.endswith(".kotlin_module"):
+                info.kotlin_modules.append(name)
+
+            # Signing / META-INF
+            elif name.startswith("META-INF/"):
+                info.signing_files.append(name)
+
+            # Sounds/fonts/videos/game data outside of assets/
+            elif ext in self._SOUND_EXTS:
+                info.sound_files.append(name)
+            elif ext in self._FONT_EXTS:
+                info.font_files.append(name)
+            elif ext in self._VIDEO_EXTS:
+                info.video_files.append(name)
+            elif ext in self._GAME_DATA_EXTS:
+                info.game_data_files.append(name)
+            elif ext in self._CONFIG_EXTS:
+                info.config_files.append(name)
+
+            # Everything else
             elif name != "AndroidManifest.xml" and name != "resources.arsc":
                 info.other_files.append(name)
+
+        # Detect game engine
+        self._detect_game_engine(zf, info)
 
     def _parse_manifest(self, zf: zipfile.ZipFile, info: ApkInfo) -> None:
         """
@@ -291,6 +390,86 @@ class ApkParser:
             elif s.endswith("Activity") and "." in s:
                 if not info.main_activity:
                     info.main_activity = s
+
+    def _detect_game_engine(self, zf: zipfile.ZipFile, info: ApkInfo) -> None:
+        """Detect which game engine the APK uses based on file signatures."""
+        all_files = set(zf.namelist())
+        lib_names = {os.path.basename(f) for f in info.native_libs}
+
+        # --- Supercell (Brawl Stars, Clash Royale, etc.) ---
+        supercell_signs = {
+            "libg.so", "libsupercell.so", "libtool.so",
+        }
+        sc_files = [f for f in info.asset_files if f.endswith(".sc")]
+        sc_csv_files = [f for f in info.asset_files if f.endswith(".csv")]
+        has_supercell_pkg = any("supercell" in (info.package_name or "").lower()
+                                for _ in [1])
+        if (supercell_signs & lib_names) or (sc_files and has_supercell_pkg) or \
+           (sc_files and sc_csv_files and len(sc_files) > 5):
+            info.detected_engine = "supercell"
+            info.engine_details = {
+                "sc_texture_files": sc_files,
+                "csv_data_files": sc_csv_files,
+                "native_libs": sorted(lib_names),
+                "note": "Supercell custom engine — uses .sc compressed textures, "
+                        "CSV game data, and native C++ game logic",
+                "ios_equivalent": "The iOS version uses the same engine compiled "
+                                  "for ARM64 (native Metal/OpenGL ES rendering)",
+            }
+            return
+
+        # --- Unity ---
+        unity_signs = {"libunity.so", "libil2cpp.so", "libmain.so"}
+        unity_assets = any(f.startswith("assets/bin/Data/") for f in all_files)
+        if (unity_signs & lib_names) or unity_assets:
+            info.detected_engine = "unity"
+            info.engine_details = {
+                "il2cpp": "libil2cpp.so" in lib_names,
+                "mono": "libmono.so" in lib_names or "libmonobdwgc-2.0.so" in lib_names,
+                "data_files": [f for f in all_files if f.startswith("assets/bin/Data/")],
+                "note": "Unity engine — native C++ runtime with IL2CPP or Mono scripting",
+                "ios_equivalent": "Rebuild from Unity project targeting iOS (Xcode export)",
+            }
+            return
+
+        # --- Unreal Engine ---
+        unreal_signs = {"libUE4.so", "libUnreal.so"}
+        unreal_assets = any(f.endswith(".uasset") or f.endswith(".umap") for f in all_files)
+        if (unreal_signs & lib_names) or unreal_assets:
+            info.detected_engine = "unreal"
+            info.engine_details = {
+                "note": "Unreal Engine — native C++ with Blueprint assets",
+                "ios_equivalent": "Rebuild from Unreal project targeting iOS",
+            }
+            return
+
+        # --- Cocos2d-x ---
+        cocos_signs = {"libcocos2dcpp.so", "libcocos2d.so", "libcocos2djs.so"}
+        if cocos_signs & lib_names:
+            info.detected_engine = "cocos2d"
+            info.engine_details = {
+                "note": "Cocos2d-x engine — C++ with Lua/JS scripting",
+                "ios_equivalent": "Rebuild from Cocos2d-x project targeting iOS",
+            }
+            return
+
+        # --- libGDX ---
+        gdx_signs = {"libgdx.so", "libgdx-box2d.so", "libgdx-freetype.so"}
+        if gdx_signs & lib_names:
+            info.detected_engine = "libgdx"
+            info.engine_details = {
+                "note": "libGDX engine — Java-based with native rendering",
+                "ios_equivalent": "Use RoboVM or MOE to run on iOS",
+            }
+            return
+
+        # --- No engine detected (standard Android app) ---
+        if info.native_libs:
+            info.detected_engine = "native"
+            info.engine_details = {
+                "native_libs": sorted(lib_names),
+                "note": "App uses native libraries — these need iOS equivalents",
+            }
 
     @staticmethod
     def _sha256(path: Path) -> str:

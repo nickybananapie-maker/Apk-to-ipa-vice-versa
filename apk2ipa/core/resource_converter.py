@@ -44,6 +44,15 @@ class ConversionStats:
     colors_converted: int = 0
     dimensions_converted: int = 0
     files_copied: int = 0
+    sounds_copied: int = 0
+    fonts_copied: int = 0
+    videos_copied: int = 0
+    game_data_copied: int = 0
+    configs_copied: int = 0
+    native_libs_cataloged: int = 0
+    xml_resources_copied: int = 0
+    other_files_copied: int = 0
+    total_bytes_copied: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -61,8 +70,8 @@ class ResourceConverter:
         self.apk_root = Path(apk_root)
         self._stats = ConversionStats()
 
-    def convert(self, output_dir: str | Path) -> ConversionStats:
-        """Run all conversions. Returns stats."""
+    def convert(self, output_dir: str | Path, apk_info=None) -> ConversionStats:
+        """Run all conversions. Returns stats. Pass apk_info for full-fidelity mode."""
         self._stats = ConversionStats()
         output_dir = Path(output_dir)
 
@@ -73,6 +82,15 @@ class ResourceConverter:
         self._convert_dimens(output_dir)
         self._copy_assets(output_dir)
         self._copy_raw(output_dir)
+
+        # Full-fidelity: copy everything else that exists
+        self._copy_sounds(output_dir)
+        self._copy_fonts(output_dir)
+        self._copy_videos(output_dir)
+        self._copy_game_data(output_dir)
+        self._copy_xml_resources(output_dir)
+        self._copy_native_libs(output_dir, apk_info)
+        self._copy_remaining_files(output_dir)
 
         return self._stats
 
@@ -409,6 +427,258 @@ class ResourceConverter:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(item, target)
                 self._stats.files_copied += 1
+
+    # ------------------------------------------------------------------
+    # Full-fidelity: copy ALL remaining file types
+    # ------------------------------------------------------------------
+
+    _SOUND_EXTS = {".ogg", ".mp3", ".wav", ".flac", ".aac", ".m4a", ".opus", ".mid", ".midi"}
+    _FONT_EXTS = {".ttf", ".otf", ".woff", ".woff2"}
+    _VIDEO_EXTS = {".mp4", ".3gp", ".webm", ".mkv", ".avi"}
+    _GAME_DATA_EXTS = {".csv", ".sc", ".json", ".bin", ".dat", ".db", ".sqlite",
+                       ".lua", ".luac", ".pkl", ".tex", ".pvr", ".ktx", ".astc",
+                       ".bnk", ".wem", ".fsb", ".atlas", ".skel", ".fnt", ".tmx"}
+
+    def _copy_by_extension(self, output_dir: Path, subdir: str,
+                            extensions: set, search_dirs: list[str] | None = None) -> int:
+        """Generic helper: copy files matching extensions into output_dir/subdir."""
+        dest = output_dir / "Resources" / subdir
+        count = 0
+        dirs_to_scan = []
+
+        if search_dirs:
+            for d in search_dirs:
+                p = self.apk_root / d
+                if p.exists():
+                    dirs_to_scan.append((p, d))
+        else:
+            dirs_to_scan.append((self.apk_root, ""))
+
+        for scan_dir, prefix in dirs_to_scan:
+            for item in scan_dir.rglob("*"):
+                if item.is_file() and item.suffix.lower() in extensions:
+                    rel = item.relative_to(self.apk_root)
+                    target = dest / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if not target.exists():
+                        shutil.copy2(item, target)
+                        self._stats.total_bytes_copied += item.stat().st_size
+                        count += 1
+        return count
+
+    def _copy_sounds(self, output_dir: Path) -> None:
+        """Copy all sound/music files."""
+        count = self._copy_by_extension(output_dir, "Sounds", self._SOUND_EXTS)
+        self._stats.sounds_copied = count
+        if count:
+            logger.info("Copied %d sound files", count)
+
+    def _copy_fonts(self, output_dir: Path) -> None:
+        """Copy all font files."""
+        count = self._copy_by_extension(output_dir, "Fonts", self._FONT_EXTS)
+        self._stats.fonts_copied = count
+        if count:
+            logger.info("Copied %d font files", count)
+
+    def _copy_videos(self, output_dir: Path) -> None:
+        """Copy all video files."""
+        count = self._copy_by_extension(output_dir, "Videos", self._VIDEO_EXTS)
+        self._stats.videos_copied = count
+        if count:
+            logger.info("Copied %d video files", count)
+
+    def _copy_game_data(self, output_dir: Path) -> None:
+        """Copy all game data files (.sc, .csv, .bin, .lua, textures, etc.)."""
+        count = self._copy_by_extension(output_dir, "GameData", self._GAME_DATA_EXTS)
+        self._stats.game_data_copied = count
+        if count:
+            logger.info("Copied %d game data files", count)
+
+    def _copy_xml_resources(self, output_dir: Path) -> None:
+        """Copy all non-layout XML resources (anim, menu, values, xml, etc.)."""
+        res_dir = self.apk_root / "res"
+        if not res_dir.exists():
+            return
+        dest = output_dir / "Resources" / "xml"
+        count = 0
+        for subdir in sorted(res_dir.iterdir()):
+            # Skip directories we already handle
+            if subdir.name.startswith(("layout", "drawable", "mipmap", "raw", "values")):
+                continue
+            if not subdir.is_dir():
+                continue
+            for item in subdir.rglob("*"):
+                if item.is_file():
+                    rel = item.relative_to(res_dir)
+                    target = dest / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(item, target)
+                    self._stats.total_bytes_copied += item.stat().st_size
+                    count += 1
+        self._stats.xml_resources_copied = count
+        if count:
+            logger.info("Copied %d XML resource files (anim, menu, etc.)", count)
+
+    def _copy_native_libs(self, output_dir: Path, apk_info=None) -> None:
+        """
+        Catalog and copy native .so libraries.
+        Generates a NativeLibs_README.md mapping them to iOS framework suggestions.
+        """
+        lib_dir = self.apk_root / "lib"
+        if not lib_dir.exists():
+            return
+
+        dest = output_dir / "Resources" / "NativeLibs"
+        dest.mkdir(parents=True, exist_ok=True)
+        count = 0
+
+        # Copy all libs preserving arch directory structure
+        for item in lib_dir.rglob("*.so"):
+            rel = item.relative_to(lib_dir)
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+            self._stats.total_bytes_copied += item.stat().st_size
+            count += 1
+
+        self._stats.native_libs_cataloged = count
+
+        # Generate mapping guide
+        self._generate_native_lib_guide(dest, apk_info)
+
+        if count:
+            logger.info("Cataloged %d native libraries", count)
+
+    def _generate_native_lib_guide(self, dest: Path, apk_info=None) -> None:
+        """Generate a guide mapping Android native libs to iOS equivalents."""
+        # Well-known native lib → iOS framework mapping
+        LIB_TO_IOS = {
+            "libg.so": ("Metal / SceneKit", "Supercell custom game engine — renders via Metal on iOS"),
+            "libsupercell.so": ("Supercell Framework", "Core Supercell engine — same codebase compiles for iOS"),
+            "libunity.so": ("Unity.framework", "Unity runtime — rebuild from Unity project"),
+            "libil2cpp.so": ("IL2CPP (compiled)", "Unity IL2CPP — C++ compiled from C# scripts"),
+            "libmain.so": ("Unity main", "Unity entry point — auto-generated by Unity build"),
+            "libUE4.so": ("Unreal Engine", "Unreal Engine — rebuild from UE project"),
+            "libcocos2dcpp.so": ("Cocos2d-x", "Cocos2d-x — rebuild from Cocos project"),
+            "libgdx.so": ("libGDX / RoboVM", "libGDX — use RoboVM or Multi-OS Engine for iOS"),
+            "libfmod.so": ("FMOD.framework", "FMOD audio engine — iOS version available"),
+            "libfmodstudio.so": ("FMODStudio.framework", "FMOD Studio — iOS version available"),
+            "libwwise.so": ("AkSoundEngine.framework", "Wwise audio — iOS SDK available"),
+            "libcrypto.so": ("Security.framework", "OpenSSL crypto — use iOS Security framework"),
+            "libssl.so": ("Security.framework", "OpenSSL SSL — use iOS URLSession / Security framework"),
+            "libsqlite.so": ("libsqlite3.tbd", "SQLite — built into iOS"),
+            "libz.so": ("libz.tbd", "zlib compression — built into iOS"),
+            "libc++_shared.so": ("libc++.tbd", "C++ standard library — built into iOS"),
+            "libGLESv2.so": ("Metal / OpenGLES.framework", "OpenGL ES — use Metal on modern iOS"),
+            "libEGL.so": ("Metal / OpenGLES.framework", "EGL — use Metal/CAEAGLLayer on iOS"),
+            "libvulkan.so": ("Metal", "Vulkan — use Metal (MoltenVK available as bridge)"),
+            "libFirebaseCrashlytics.so": ("FirebaseCrashlytics (SPM)", "Firebase Crashlytics — install via SPM"),
+            "libgoogleplay.so": ("GameKit.framework", "Google Play Games → Apple GameKit / Game Center"),
+        }
+
+        lines = [
+            "# Native Library Mapping Guide",
+            "",
+            "This document maps Android native libraries (`.so`) to their iOS equivalents.",
+            "Native libraries cannot be directly converted — they must be replaced with",
+            "iOS framework equivalents or rebuilt from source.",
+            "",
+        ]
+
+        if apk_info and apk_info.detected_engine:
+            lines += [
+                f"## Detected Engine: **{apk_info.detected_engine.title()}**",
+                "",
+            ]
+            if apk_info.engine_details.get("note"):
+                lines.append(f"> {apk_info.engine_details['note']}")
+                lines.append("")
+            if apk_info.engine_details.get("ios_equivalent"):
+                lines.append(f"> **iOS equivalent:** {apk_info.engine_details['ios_equivalent']}")
+                lines.append("")
+
+        if apk_info and apk_info.native_lib_archs:
+            lines.append("## Architectures Found")
+            lines.append("")
+            for arch, libs in sorted(apk_info.native_lib_archs.items()):
+                lines.append(f"### `{arch}` ({len(libs)} libraries)")
+                lines.append("")
+                lines.append("| Android Library | iOS Equivalent | Notes |")
+                lines.append("|---|---|---|")
+                for lib in sorted(libs):
+                    if lib in LIB_TO_IOS:
+                        ios_fw, note = LIB_TO_IOS[lib]
+                        lines.append(f"| `{lib}` | **{ios_fw}** | {note} |")
+                    else:
+                        lines.append(f"| `{lib}` | ⚠️ *Manual mapping needed* | Custom native library |")
+                lines.append("")
+        else:
+            # Scan the dest directory
+            lines.append("## Libraries")
+            lines.append("")
+            for so_file in sorted(dest.rglob("*.so")):
+                lib = so_file.name
+                if lib in LIB_TO_IOS:
+                    ios_fw, note = LIB_TO_IOS[lib]
+                    lines.append(f"- `{lib}` → **{ios_fw}** — {note}")
+                else:
+                    lines.append(f"- `{lib}` → ⚠️ Manual mapping needed")
+            lines.append("")
+
+        lines += [
+            "## Next Steps",
+            "",
+            "1. For game engines (Supercell/Unity/Unreal): rebuild from the original project source",
+            "2. For common libraries (SSL, SQLite, zlib): iOS has built-in equivalents",
+            "3. For audio engines (FMOD, Wwise): download the iOS SDK from the vendor",
+            "4. For custom `.so` files: rewrite in Swift/C++ or find iOS alternatives",
+        ]
+
+        (dest / "NativeLibs_README.md").write_text("\n".join(lines), encoding="utf-8")
+
+    def _copy_remaining_files(self, output_dir: Path) -> None:
+        """Copy any remaining files not yet handled — nothing left behind."""
+        dest = output_dir / "Resources" / "Other"
+        count = 0
+
+        # Track what we've already copied by checking existing output dirs
+        already_handled_prefixes = {
+            "classes", "res/layout", "res/drawable", "res/mipmap",
+            "res/raw", "res/values", "assets/", "lib/", "META-INF/",
+            "kotlin/", "AndroidManifest.xml", "resources.arsc",
+        }
+
+        for item in self.apk_root.rglob("*"):
+            if not item.is_file():
+                continue
+            rel = item.relative_to(self.apk_root)
+            rel_str = str(rel)
+
+            # Skip if already handled
+            skip = False
+            for prefix in already_handled_prefixes:
+                if rel_str.startswith(prefix):
+                    skip = True
+                    break
+            if skip:
+                continue
+
+            # Skip files already copied by extension-based methods
+            ext = item.suffix.lower()
+            all_exts = self._SOUND_EXTS | self._FONT_EXTS | self._VIDEO_EXTS | self._GAME_DATA_EXTS
+            if ext in all_exts:
+                continue
+
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.copy2(item, target)
+                self._stats.total_bytes_copied += item.stat().st_size
+                count += 1
+
+        self._stats.other_files_copied = count
+        if count:
+            logger.info("Copied %d remaining files", count)
 
 
 # ---------------------------------------------------------------------------

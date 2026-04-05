@@ -103,7 +103,7 @@ class XcodeProjectBuilder:
         # Convert resources
         print("  [4/6] Converting resources...")
         res_converter = ResourceConverter(extract_dir)
-        res_stats = res_converter.convert(app_src)
+        res_stats = res_converter.convert(app_src, apk_info=self._info)
 
         # Translate code
         print("  [5/6] Decompiling and translating code...")
@@ -448,7 +448,40 @@ class XcodeProjectBuilder:
             "",
         ]
 
+        # Game engine info
+        if self._info and self._info.detected_engine:
+            guide_lines += [
+                f"## Detected Game Engine: **{self._info.detected_engine.title()}**",
+                "",
+            ]
+            if self._info.engine_details.get("note"):
+                guide_lines.append(f"> {self._info.engine_details['note']}")
+                guide_lines.append("")
+            if self._info.engine_details.get("ios_equivalent"):
+                guide_lines.append(f"> **iOS path:** {self._info.engine_details['ios_equivalent']}")
+                guide_lines.append("")
+
+        # APK stats
+        if self._info:
+            size_mb = self._info.total_size_bytes / (1024 * 1024)
+            guide_lines += [
+                f"## APK Statistics",
+                "",
+                f"- **Total files in APK:** {self._info.total_files}",
+                f"- **Uncompressed size:** {size_mb:.1f} MB",
+                f"- **DEX files:** {len(self._info.dex_files)}",
+                f"- **Native libraries:** {len(self._info.native_libs)}",
+                f"- **Architectures:** {', '.join(sorted(self._info.native_lib_archs.keys())) or 'none'}",
+                f"- **Asset files:** {len(self._info.asset_files)}",
+                f"- **Sound files:** {len(self._info.sound_files)}",
+                f"- **Font files:** {len(self._info.font_files)}",
+                f"- **Game data files:** {len(self._info.game_data_files)}",
+                "",
+            ]
+
         guide_lines += [
+            f"## What was converted",
+            "",
             f"- **Manifest** → `Info.plist` (bundle ID, version, permissions, orientations)",
             f"- **Resources** → `Images.xcassets`, `Localizable.strings`, `Color+AppColors.swift`",
             f"  - {res_stats.images_converted} images",
@@ -456,6 +489,19 @@ class XcodeProjectBuilder:
             f"  - {res_stats.colors_converted} colors",
             f"- **Layouts** → SwiftUI views: {code_summary.get('layout_files_converted', 0)} files",
             f"- **Java code** → Swift: {code_summary.get('swift_files_written', 0)} files",
+            f"- **Sounds** → Resources/Sounds: {res_stats.sounds_copied} files",
+            f"- **Fonts** → Resources/Fonts: {res_stats.fonts_copied} files",
+            f"- **Videos** → Resources/Videos: {res_stats.videos_copied} files",
+            f"- **Game data** → Resources/GameData: {res_stats.game_data_copied} files",
+            f"- **XML resources** → Resources/xml: {res_stats.xml_resources_copied} files",
+            f"- **Native libs** → Resources/NativeLibs: {res_stats.native_libs_cataloged} libraries (see NativeLibs_README.md)",
+            f"- **Other files** → Resources/Other: {res_stats.other_files_copied} files",
+            "",
+        ]
+
+        copied_mb = res_stats.total_bytes_copied / (1024 * 1024)
+        guide_lines += [
+            f"**Total resource data copied: {copied_mb:.1f} MB**",
             "",
             "## Items requiring manual review",
             "",
