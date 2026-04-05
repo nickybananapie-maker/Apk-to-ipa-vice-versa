@@ -236,6 +236,35 @@ def layout(xml_path: Path, output: Path | None, name: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# package (IPA)
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.argument("project_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--output", "-o", type=click.Path(path_type=Path),
+              default=None, help="Output .ipa path")
+@click.option("--name", "-n", default=None, help="App name for the .ipa bundle")
+def package(project_dir: Path, output: Path | None, name: str | None) -> None:
+    """
+    Package a converted Xcode project into a .ipa file.
+
+    \b
+    Example:
+        apk2ipa package output/brawl_stars/ConvertedApp
+        apk2ipa package output/MyApp/ConvertedApp -o MyApp.ipa
+    """
+    from apk2ipa.core.ipa_packager import package_ipa
+
+    try:
+        ipa_path = package_ipa(project_dir, output_path=output, app_name=name)
+        click.echo(f"\n✓ IPA created: {ipa_path}")
+    except Exception as e:
+        click.echo(f"\n✗ Packaging failed: {e}", err=True)
+        logging.exception("Packaging error")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # decompile
 # ---------------------------------------------------------------------------
 
