@@ -35,9 +35,16 @@ class CodeTranslator:
         translator.translate(output_dir="/tmp/ios_src")
     """
 
-    def __init__(self, apk_root: str | Path, apk_info=None):
+    def __init__(self, apk_root: str | Path, apk_info=None,
+                 predecompiled_java_dir: str | Path | None = None,
+                 jadx_bin: str | None = None):
         self.apk_root = Path(apk_root)
         self.apk_info = apk_info
+        # If pre-decompiled Java sources already exist (e.g. from a previous jadx
+        # run), point directly to them and skip the decompilation step.
+        self._predecompiled = Path(predecompiled_java_dir) if predecompiled_java_dir else None
+        # Optional override for the jadx binary path
+        self._jadx_bin = jadx_bin or self._find_jadx()
         self._transpiler = JavaToSwiftTranspiler()
         self._layout_converter = LayoutConverter()
         self._decompiled_java: Optional[Path] = None
@@ -58,8 +65,13 @@ class CodeTranslator:
             "decompiler_used": "none",
         }
 
-        # Step 1: Decompile DEX → Java
-        java_dir = self._decompile_dex(summary)
+        # Step 1: Decompile DEX → Java (skip if pre-decompiled sources given)
+        if self._predecompiled and self._predecompiled.exists():
+            java_dir = self._predecompiled
+            summary["decompiler_used"] = "pre-decompiled (jadx)"
+            logger.info("Using pre-decompiled Java sources from %s", java_dir)
+        else:
+            java_dir = self._decompile_dex(summary)
 
         # Step 2: Transpile Java → Swift
         if java_dir and java_dir.exists():
@@ -86,21 +98,26 @@ class CodeTranslator:
 
         java_dir = self.apk_root / "_decompiled_java"
 
-        # Try jadx first
-        if shutil.which("jadx"):
+        # Try jadx first (prefer self._jadx_bin if set)
+        jadx = self._jadx_bin
+        if jadx:
             try:
+                # Run on the full APK (not just classes.dex) to get all classes
+                apk_candidates = list(self.apk_root.parent.glob("*.apk"))
+                apk_arg = str(apk_candidates[0]) if apk_candidates else str(self.apk_root / "classes.dex")
                 result = subprocess.run(
-                    ["jadx", "--output-dir", str(java_dir),
-                     "--deobf",
-                     str(self.apk_root / "classes.dex")],
-                    capture_output=True, text=True, timeout=300
+                    [jadx, "--output-dir", str(java_dir),
+                     "--deobf", "--no-imports", "--threads-count", "4",
+                     apk_arg],
+                    capture_output=True, text=True, timeout=600
                 )
-                if result.returncode == 0 and java_dir.exists():
+                out_sources = java_dir / "sources"
+                if out_sources.exists() and any(out_sources.rglob("*.java")):
                     summary["decompiler_used"] = "jadx"
-                    logger.info("Decompiled with jadx")
-                    return java_dir / "sources"
+                    logger.info("Decompiled with jadx → %s", out_sources)
+                    return out_sources
                 else:
-                    logger.warning("jadx failed: %s", result.stderr[:200])
+                    logger.warning("jadx produced no Java files: %s", result.stderr[:200])
             except Exception as e:
                 logger.warning("jadx error: %s", e)
 
@@ -170,7 +187,7 @@ class CodeTranslator:
             data = dex_file.read_bytes()
             # DEX string pool scanning for class descriptors
             # Pattern: Lcom/example/ClassName;
-            for m in re.finditer(rb"L([a-zA-Z][a-zA-Z0-9_/\$]*);", data):
+            for m in re.finditer(rb"L([a-zA-Z][a-zA-Z0-9_/\$]*);" , data):
                 descriptor = m.group(1).decode("ascii", errors="ignore")
                 if "/" in descriptor and not descriptor.startswith("java/") \
                         and not descriptor.startswith("android/") \
@@ -330,6 +347,20 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {{
 }}
 '''
         (output_dir / "SceneDelegate.swift").write_text(scene_delegate, encoding="utf-8")
+
+
+    @staticmethod
+    def _find_jadx() -> str | None:
+        """Locate the jadx binary on PATH or common install locations."""
+        for candidate in [
+            shutil.which("jadx"),
+            "/opt/jadx/bin/jadx",
+            "/usr/local/bin/jadx",
+            "/usr/bin/jadx",
+        ]:
+            if candidate and Path(candidate).exists():
+                return candidate
+        return None
 
 
 # ---------------------------------------------------------------------------

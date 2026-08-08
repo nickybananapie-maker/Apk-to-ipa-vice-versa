@@ -51,7 +51,11 @@ def main(verbose: bool) -> None:
               default=None, help="Output directory (default: ./output/<app_name>)")
 @click.option("--no-decompile", is_flag=True,
               help="Skip DEX decompilation (generate stubs only)")
-def convert(apk_path: Path, output: Path | None, no_decompile: bool) -> None:
+@click.option("--java-src", type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help="Path to pre-decompiled Java sources (e.g. from jadx --output-dir)")
+def convert(apk_path: Path, output: Path | None, no_decompile: bool,
+            java_src: Path | None) -> None:
     """
     Convert an APK to a buildable Xcode project.
 
@@ -59,6 +63,7 @@ def convert(apk_path: Path, output: Path | None, no_decompile: bool) -> None:
     Example:
         apk2ipa convert myapp.apk
         apk2ipa convert myapp.apk --output ~/Desktop/ios_project
+        apk2ipa convert myapp.apk --java-src ./jadx_out/sources
     """
     from apk2ipa.core.ipa_builder import XcodeProjectBuilder
 
@@ -69,7 +74,7 @@ def convert(apk_path: Path, output: Path | None, no_decompile: bool) -> None:
     click.echo("=" * 50)
 
     try:
-        builder = XcodeProjectBuilder(apk_path)
+        builder = XcodeProjectBuilder(apk_path, predecompiled_java_dir=java_src)
         xcodeproj = builder.build(output_dir=output)
 
         click.echo("\n✓ Done!")
